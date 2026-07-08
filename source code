@@ -1,0 +1,505 @@
+/*
+ * ============================================================
+ *  SMART BATTERY MANAGEMENT SYSTEM — COMPLETE PROJECT
+ *  ElevanceSkills Internship | All 6 Tasks Integrated
+ *  Platform  : ESP32 (Arduino Framework)
+ *  Simulator : Wokwi | Cloud: Blynk IoT
+ * ============================================================
+ *  TASK 1 : Multi-Cell Battery Intelligence Engine
+ *  TASK 2 : Event-Driven Safety Protection Kernel
+ *  TASK 3 : Intelligent HMI & Diagnostic Interface
+ *  TASK 4 : Fault-Tolerant Runtime System
+ *  TASK 5 : Intelligent Cloud Telemetry
+ *  TASK 6 : Executive Battery Intelligence Dashboard
+ * ============================================================
+ */
+
+#define BLYNK_TEMPLATE_ID "TMPL3Gpng4IGh"
+#define BLYNK_TEMPLATE_NAME "Smart BMS"
+#define BLYNK_AUTH_TOKEN    "PUHqRNrD0lpAAjRDhFzGricmIaBcrHSZ"
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+char ssid[] = "Wokwi-GUEST";
+char pass[] = "";
+
+// ============================================================
+//  PIN DEFINITIONS
+// ============================================================
+#define CELL1_PIN   34
+#define CELL2_PIN   35
+#define CELL3_PIN   32
+#define CELL4_PIN   33
+#define LED_RED     5
+#define LED_GREEN   18
+#define LED_YELLOW  19
+#define BUZZER_PIN  25
+#define RELAY_PIN   26
+
+// ============================================================
+//  ALL ENUMS FIRST
+// ============================================================
+enum HealthState {
+  HEALTHY, MINOR_IMBALANCE, CRITICAL_IMBALANCE, PACK_FAILURE
+};
+enum ProtectionEvent {
+  NO_FAULT, WEAK_CELL, OVERVOLTAGE, UNDERVOLTAGE, SENSOR_ANOMALY, RAPID_FLUCTUATION
+};
+enum SystemMode {
+  MODE_NORMAL, MODE_DEGRADED, MODE_FAILSAFE, MODE_SHUTDOWN
+};
+
+// ============================================================
+//  CONSTANTS
+// ============================================================
+#define NUM_CELLS            4
+#define ADC_MAX              4095
+#define V_SCALE              4.2
+#define V_MIN                2.5
+#define V_LOW                3.0
+#define V_NORMAL_HIGH        4.0
+#define RELAY_CHATTER_DELAY  2000
+#define BUZZER_ON_TIME       200
+#define BUZZER_OFF_TIME      300
+#define LCD_SCREEN_COUNT     4
+#define LCD_ROTATE_MS        3000
+#define WIFI_RETRY_MS        10000
+#define TELEMETRY_FORCE_MS   30000
+#define DASHBOARD_PRINT_MS   5000
+#define FROZEN_LIMIT         20
+#define FAULT_LOG_SIZE       5
+
+// ============================================================
+//  OBJECTS
+// ============================================================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+BlynkTimer blynkTimer;
+
+// ============================================================
+//  BATTERY DATA
+// ============================================================
+struct BatteryData {
+  float cellVoltage[NUM_CELLS];
+  float packAverage;
+  float imbalancePct;
+  int   weakestCell;
+  int   strongestCell;
+  float minCellV;
+  float maxCellV;
+  float healthPct;
+  HealthState healthState;
+};
+BatteryData battery;
+
+// ============================================================
+//  GLOBAL STATE VARIABLES
+// ============================================================
+bool            relayState        = true;
+bool            buzzerState       = false;
+bool            safetyFaultActive = false;
+String          safetyFaultReason = "None";
+ProtectionEvent currentProtection = NO_FAULT;
+SystemMode      systemMode        = MODE_NORMAL;
+
+unsigned long lastRelayChange  = 0;
+unsigned long lastBuzzerToggle = 0;
+unsigned long lastScreenChange = 0;
+unsigned long lastForcedSend   = 0;
+unsigned long lastWifiAttempt  = 0;
+unsigned long lastDashPrint    = 0;
+
+int   currentScreen  = 0;
+float lastPackAvg    = -1;
+int   frozenCount    = 0;
+
+float voltageHistory[5] = {3.7, 3.7, 3.7, 3.7, 3.7};
+int   historyIndex      = 0;
+
+bool  pendingTelemetry = false;
+HealthState lastHealthState = HEALTHY;
+SystemMode  lastSysMode     = MODE_NORMAL;
+bool        lastRelayState  = true;
+float       lastAvgVoltage  = 0;
+
+struct FaultEntry { unsigned long timestamp; String description; };
+FaultEntry faultLog[FAULT_LOG_SIZE];
+int faultLogCount = 0;
+int faultLogIndex = 0;
+
+// ============================================================
+//  HELPER STRINGS
+// ============================================================
+String healthStr() {
+  switch (battery.healthState) {
+    case HEALTHY:            return "HEALTHY";
+    case MINOR_IMBALANCE:    return "MINOR IMBAL";
+    case CRITICAL_IMBALANCE: return "CRIT IMBAL";
+    case PACK_FAILURE:       return "PACK FAIL";
+    default:                 return "UNKNOWN";
+  }
+}
+String modeStr() {
+  switch (systemMode) {
+    case MODE_NORMAL:   return "NORMAL";
+    case MODE_DEGRADED: return "DEGRADED";
+    case MODE_FAILSAFE: return "FAILSAFE";
+    case MODE_SHUTDOWN: return "SHUTDOWN";
+    default:            return "UNKNOWN";
+  }
+}
+
+// ============================================================
+//  TASK 1 — BATTERY INTELLIGENCE ENGINE
+// ============================================================
+float readCell(int pin) {
+  int raw = analogRead(pin);
+  float v = (raw / (float)ADC_MAX) * V_SCALE;
+  // In Wokwi, pot at zero = 0V. Map 0V reads to 3.5V default
+  // so simulation starts in NORMAL state
+  if (v < 0.1) v = 3.5;
+  return v;
+}
+
+void updateBatteryIntelligence() {
+  int pins[NUM_CELLS] = {CELL1_PIN, CELL2_PIN, CELL3_PIN, CELL4_PIN};
+  float sum = 0;
+  float minV = 999, maxV = 0;
+  int   minIdx = 0, maxIdx = 0;
+
+  for (int i = 0; i < NUM_CELLS; i++) {
+    battery.cellVoltage[i] = readCell(pins[i]);
+    sum += battery.cellVoltage[i];
+    if (battery.cellVoltage[i] < minV) { minV = battery.cellVoltage[i]; minIdx = i; }
+    if (battery.cellVoltage[i] > maxV) { maxV = battery.cellVoltage[i]; maxIdx = i; }
+  }
+
+  battery.packAverage   = sum / NUM_CELLS;
+  battery.minCellV      = minV;
+  battery.maxCellV      = maxV;
+  battery.weakestCell   = minIdx + 1;
+  battery.strongestCell = maxIdx + 1;
+
+  float spread = maxV - minV;
+  battery.imbalancePct = (battery.packAverage > 0)
+                         ? (spread / battery.packAverage) * 100.0 : 0;
+
+  float pct = ((battery.packAverage - V_LOW) / (V_SCALE - V_LOW)) * 100.0;
+  battery.healthPct = constrain(pct, 0, 100);
+
+  if      (battery.minCellV < V_MIN)    battery.healthState = PACK_FAILURE;
+  else if (battery.imbalancePct > 10.0) battery.healthState = CRITICAL_IMBALANCE;
+  else if (battery.imbalancePct > 5.0)  battery.healthState = MINOR_IMBALANCE;
+  else                                  battery.healthState = HEALTHY;
+}
+
+// ============================================================
+//  TASK 2 — SAFETY PROTECTION KERNEL
+// ============================================================
+void updateVoltageHistory(float v) {
+  voltageHistory[historyIndex] = v;
+  historyIndex = (historyIndex + 1) % 5;
+}
+
+bool detectRapidFluctuation() {
+  float mn = 999, mx = 0;
+  for (int i = 0; i < 5; i++) {
+    if (voltageHistory[i] < mn) mn = voltageHistory[i];
+    if (voltageHistory[i] > mx) mx = voltageHistory[i];
+  }
+  return (mx - mn) > 0.5;
+}
+
+ProtectionEvent evaluateSafety() {
+  if (battery.minCellV < V_MIN)    return UNDERVOLTAGE;
+  if (battery.maxCellV > V_SCALE)  return OVERVOLTAGE;
+  if (battery.imbalancePct > 10.0) return WEAK_CELL;
+  if (detectRapidFluctuation())    return RAPID_FLUCTUATION;
+  return NO_FAULT;
+}
+
+void setRelay(bool closed) {
+  unsigned long now = millis();
+  if ((now - lastRelayChange) < RELAY_CHATTER_DELAY) return;
+  if (relayState == closed) return;
+  relayState = closed;
+  digitalWrite(RELAY_PIN, closed ? HIGH : LOW);
+  lastRelayChange = now;
+}
+
+void updateBuzzer(bool on) {
+  unsigned long now = millis();
+  if (!on) { digitalWrite(BUZZER_PIN, LOW); buzzerState = false; return; }
+  unsigned long intv = buzzerState ? BUZZER_ON_TIME : BUZZER_OFF_TIME;
+  if ((now - lastBuzzerToggle) >= intv) {
+    buzzerState = !buzzerState;
+    digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+    lastBuzzerToggle = now;
+  }
+}
+
+void runSafetyKernel() {
+  updateVoltageHistory(battery.packAverage);
+  currentProtection = evaluateSafety();
+  safetyFaultActive = (currentProtection != NO_FAULT);
+
+  switch (currentProtection) {
+    case NO_FAULT:
+      safetyFaultReason = "None";
+      setRelay(true); updateBuzzer(false);
+      digitalWrite(LED_GREEN, HIGH);
+      digitalWrite(LED_RED,   LOW);
+      digitalWrite(LED_YELLOW,LOW);
+      break;
+    case UNDERVOLTAGE:
+      safetyFaultReason = "Undervoltage";
+      setRelay(false); updateBuzzer(true);
+      digitalWrite(LED_RED,   HIGH);
+      digitalWrite(LED_GREEN, LOW);
+      digitalWrite(LED_YELLOW,LOW);
+      break;
+    case OVERVOLTAGE:
+      safetyFaultReason = "Overvoltage";
+      setRelay(false); updateBuzzer(true);
+      digitalWrite(LED_YELLOW,HIGH);
+      digitalWrite(LED_GREEN, LOW);
+      digitalWrite(LED_RED,   LOW);
+      break;
+    case WEAK_CELL:
+      safetyFaultReason = "Weak Cell";
+      setRelay(false); updateBuzzer(true);
+      digitalWrite(LED_RED,   HIGH);
+      digitalWrite(LED_GREEN, LOW);
+      digitalWrite(LED_YELLOW,LOW);
+      break;
+    case RAPID_FLUCTUATION:
+      safetyFaultReason = "Fluctuation";
+      updateBuzzer(true);
+      digitalWrite(LED_YELLOW,HIGH);
+      digitalWrite(LED_GREEN, LOW);
+      break;
+    default:
+      safetyFaultReason = "Unknown";
+      break;
+  }
+}
+
+// ============================================================
+//  TASK 3 — LCD HMI
+// ============================================================
+void lcdS0() {
+  lcd.setCursor(0,0);
+  lcd.print("C1:"); lcd.print(battery.cellVoltage[0],1);
+  lcd.print(" C2:"); lcd.print(battery.cellVoltage[1],1);
+  lcd.setCursor(0,1);
+  lcd.print("C3:"); lcd.print(battery.cellVoltage[2],1);
+  lcd.print(" C4:"); lcd.print(battery.cellVoltage[3],1);
+}
+void lcdS1() {
+  lcd.setCursor(0,0);
+  lcd.print("Avg:"); lcd.print(battery.packAverage,2);
+  lcd.print("V "); lcd.print((int)battery.healthPct); lcd.print("%");
+  lcd.setCursor(0,1);
+  lcd.print("Imb:"); lcd.print(battery.imbalancePct,1);
+  lcd.print("% W:C"); lcd.print(battery.weakestCell);
+}
+void lcdS2() {
+  lcd.setCursor(0,0); lcd.print("Health:         ");
+  lcd.setCursor(0,1); lcd.print(healthStr()); lcd.print("          ");
+}
+void lcdS3() {
+  lcd.setCursor(0,0);
+  lcd.print("Relay:"); lcd.print(relayState?"ON ":"OFF");
+  lcd.print(" "); lcd.print(modeStr().substring(0,5));
+  lcd.setCursor(0,1);
+  lcd.print("Fault:"); lcd.print(safetyFaultReason.substring(0,10));
+}
+void lcdFault() {
+  lcd.setCursor(0,0); lcd.print("!!FAULT ACTIVE!!");
+  lcd.setCursor(0,1); lcd.print(safetyFaultReason.substring(0,16));
+}
+
+void updateLCD() {
+  if (safetyFaultActive) { lcdFault(); return; }
+  unsigned long now = millis();
+  if ((now - lastScreenChange) >= LCD_ROTATE_MS) {
+    lcd.clear();
+    currentScreen = (currentScreen + 1) % LCD_SCREEN_COUNT;
+    lastScreenChange = now;
+  }
+  switch (currentScreen) {
+    case 0: lcdS0(); break;
+    case 1: lcdS1(); break;
+    case 2: lcdS2(); break;
+    case 3: lcdS3(); break;
+  }
+}
+
+// ============================================================
+//  TASK 4 — FAULT TOLERANT RUNTIME
+// ============================================================
+void logFault(String d) {
+  faultLog[faultLogIndex] = {millis()/1000, d};
+  faultLogIndex = (faultLogIndex + 1) % FAULT_LOG_SIZE;
+  if (faultLogCount < FAULT_LOG_SIZE) faultLogCount++;
+}
+
+void updateSystemMode() {
+  if (abs(battery.packAverage - lastPackAvg) < 0.001) frozenCount++;
+  else frozenCount = 0;
+  lastPackAvg = battery.packAverage;
+
+  bool adcFrozen  = (frozenCount >= FROZEN_LIMIT);
+  bool critFault  = (battery.healthState == PACK_FAILURE);
+  bool minorFault = (battery.healthState == CRITICAL_IMBALANCE);
+
+  if (adcFrozen) {
+    if (systemMode != MODE_SHUTDOWN) logFault("ADC Frozen");
+    systemMode = MODE_SHUTDOWN;
+  } else if (critFault) {
+    if (systemMode == MODE_NORMAL) logFault("Pack Failure");
+    systemMode = MODE_FAILSAFE;
+  } else if (minorFault) {
+    if (systemMode == MODE_NORMAL) logFault("Crit Imbalance");
+    systemMode = MODE_DEGRADED;
+  } else {
+    if (systemMode == MODE_FAILSAFE) systemMode = MODE_DEGRADED;
+    else if (systemMode == MODE_DEGRADED) systemMode = MODE_NORMAL;
+  }
+}
+
+// ============================================================
+//  TASK 5 — CLOUD TELEMETRY
+// ============================================================
+void sendToBlynk() {
+  if (!Blynk.connected()) { pendingTelemetry = true; return; }
+  Blynk.virtualWrite(V0, battery.packAverage);
+  Blynk.virtualWrite(V1, battery.cellVoltage[0]);
+  Blynk.virtualWrite(V2, battery.cellVoltage[1]);
+  Blynk.virtualWrite(V3, battery.cellVoltage[2]);
+  Blynk.virtualWrite(V4, battery.cellVoltage[3]);
+  Blynk.virtualWrite(V5, battery.healthPct);
+  Blynk.virtualWrite(V6, healthStr());
+  Blynk.virtualWrite(V7, safetyFaultReason);
+  pendingTelemetry = false;
+  Serial.println("[Blynk] Data sent");
+}
+
+void handleTelemetry() {
+  unsigned long now = millis();
+  if (!Blynk.connected()) {
+    if ((now - lastWifiAttempt) >= WIFI_RETRY_MS) {
+      lastWifiAttempt = now;
+      Blynk.connect(3000);
+    }
+    return;
+  }
+  bool changed   = (battery.healthState != lastHealthState ||
+                    systemMode != lastSysMode ||
+                    relayState != lastRelayState ||
+                    abs(battery.packAverage - lastAvgVoltage) > 0.05);
+  bool force     = ((now - lastForcedSend) >= TELEMETRY_FORCE_MS);
+  bool violation = (battery.packAverage < V_LOW ||
+                    battery.packAverage > V_NORMAL_HIGH ||
+                    battery.imbalancePct > 5.0);
+
+  if (changed || force || violation || pendingTelemetry) {
+    sendToBlynk();
+    lastHealthState = battery.healthState;
+    lastSysMode     = systemMode;
+    lastRelayState  = relayState;
+    lastAvgVoltage  = battery.packAverage;
+    lastForcedSend  = now;
+  }
+}
+
+// ============================================================
+//  TASK 6 — EXECUTIVE DASHBOARD
+// ============================================================
+void printDashboard() {
+  unsigned long now = millis();
+  if ((now - lastDashPrint) < DASHBOARD_PRINT_MS) return;
+  lastDashPrint = now;
+
+  Serial.println("================================================");
+  Serial.println("      SMART BMS - EXECUTIVE DASHBOARD          ");
+  Serial.println("================================================");
+  for (int i = 0; i < NUM_CELLS; i++) {
+    Serial.printf("  Cell %d: %.2fV", i+1, battery.cellVoltage[i]);
+    if ((i+1)==battery.weakestCell)   Serial.print(" <<WEAKEST");
+    if ((i+1)==battery.strongestCell) Serial.print(" <<STRONGEST");
+    Serial.println();
+  }
+  Serial.printf("  Avg: %.2fV | Imbalance: %.1f%% | Health: %.0f%%\n",
+    battery.packAverage, battery.imbalancePct, battery.healthPct);
+  Serial.printf("  State: %s | Mode: %s\n", healthStr().c_str(), modeStr().c_str());
+  Serial.printf("  Relay: %s | Fault: %s\n",
+    relayState?"CLOSED":"OPEN", safetyFaultReason.c_str());
+  Serial.println("--- FAULT LOG ---");
+  if (faultLogCount == 0) Serial.println("  No faults.");
+  for (int i = 0; i < faultLogCount; i++)
+    Serial.printf("  [%lus] %s\n", faultLog[i].timestamp, faultLog[i].description.c_str());
+  Serial.println("--- RECOMMENDATION ---");
+  switch (battery.healthState) {
+    case HEALTHY:            Serial.println("  System OK. No action needed."); break;
+    case MINOR_IMBALANCE:    Serial.println("  Monitor imbalance. Consider balancing."); break;
+    case CRITICAL_IMBALANCE: Serial.println("  WARNING: Balance pack immediately!"); break;
+    case PACK_FAILURE:       Serial.println("  CRITICAL: Replace weakest cell NOW!"); break;
+  }
+  Serial.println("================================================\n");
+}
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(LED_RED,    OUTPUT);
+  pinMode(LED_GREEN,  OUTPUT);
+  pinMode(LED_YELLOW, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RELAY_PIN,  OUTPUT);
+
+  digitalWrite(LED_RED,    LOW);
+  digitalWrite(LED_GREEN,  HIGH);  // Start green = normal
+  digitalWrite(LED_YELLOW, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(RELAY_PIN,  HIGH);  // Relay closed by default
+
+  analogReadResolution(12);
+
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0); lcd.print("  Smart BMS     ");
+  lcd.setCursor(0, 1); lcd.print(" Initializing.. ");
+  delay(2000);
+  lcd.clear();
+
+  Serial.println("[BMS] Connecting to Blynk...");
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  Serial.println("[BMS] System Ready!");
+  lcd.setCursor(0, 0); lcd.print("  BMS Online!   ");
+  lcd.setCursor(0, 1); lcd.print(" Twist pots now ");
+  delay(1000);
+  lcd.clear();
+}
+
+// ============================================================
+//  LOOP
+// ============================================================
+void loop() {
+  updateBatteryIntelligence();  // TASK 1
+  updateSystemMode();           // TASK 4
+  runSafetyKernel();            // TASK 2
+  updateLCD();                  // TASK 3
+  handleTelemetry();            // TASK 5
+  printDashboard();             // TASK 6
+  Blynk.run();
+  delay(100);
+}
